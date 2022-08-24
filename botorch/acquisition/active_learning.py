@@ -35,6 +35,65 @@ from botorch.utils.transforms import concatenate_pending_points, t_batch_mode_tr
 from torch import Tensor
 
 
+class PosteriorVariance(AnalyticAcquisitionFunction):
+    def __init__(
+        self,
+        model: Model,
+        posterior_transform: Optional[PosteriorTransform] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            model=model,
+            posterior_transform=posterior_transform,
+            **kwargs
+        )
+
+    @t_batch_mode_transform(expected_q=1)
+    def forward(self, X):
+        posterior = self.model.posterior(
+            X=X,
+            posterior_transform=self.posterior_transform
+        )
+        mean = posterior.mean
+        variance = posterior.variance
+        view_shape = (
+            mean.shape[:-2] if mean.shape[-2] == 1 else mean.shape[:-1]
+        )
+        return variance.view(view_shape)
+
+
+class qPosteriorVariance(MCAcquisitionFunction):
+    def __init__(
+        self,
+        model,
+        sampler=None,
+        objective=None,
+        posterior_transform=None,
+        X_pending=None,
+        **kwargs,
+    ):
+        super().__init__(
+            model=model,
+            sampler=sampler,
+            objective=objective,
+            posterior_transform=posterior_transform,
+            X_pending=X_pending,
+            **kwargs,
+        )
+
+    @concatenate_pending_points
+    @t_batch_mode_transform()
+    def forward(self, X):
+        posterior = self.model.posterior(
+            X=X,
+            posterior_transform=self.posterior_transform
+        )
+        objective = self.objective(self.sampler(posterior), X=X)
+        mu = objective.mean(dim=0)
+        samples = (objective - mu).abs()
+        return samples.max(dim=-1)[0].mean(dim=0)
+
+
 class qNegIntegratedPosteriorVariance(AnalyticAcquisitionFunction):
     r"""Batch Integrated Negative Posterior Variance for Active Learning.
 
