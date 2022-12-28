@@ -57,6 +57,7 @@ def gen_batch_initial_conditions(
     options: Optional[Dict[str, Union[bool, float, int]]] = None,
     inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
     equality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
+    nonlinear_constraint: Optional[callable] = None,
 ) -> Tensor:
     r"""Generate a batch of initial conditions for random-restart optimziation.
 
@@ -140,7 +141,13 @@ def gen_batch_initial_conditions(
     while factor < max_factor:
         with warnings.catch_warnings(record=True) as ws:
             n = raw_samples * factor
-            if inequality_constraints is None and equality_constraints is None:
+
+            # No constraints at all
+            if (
+                inequality_constraints is None
+                and equality_constraints is None
+                and inequality_constraints is None
+            ):
                 if effective_dim <= SobolEngine.MAXDIM:
                     X_rnd = draw_sobol_samples(bounds=bounds_cpu, n=n, q=q, seed=seed)
                 else:
@@ -150,7 +157,11 @@ def gen_batch_initial_conditions(
                             n, q, bounds_cpu.shape[-1], dtype=bounds.dtype
                         )
                     X_rnd = bounds_cpu[0] + (bounds_cpu[1] - bounds_cpu[0]) * X_rnd_nlzd
-            else:
+
+            # Inequality or equality constraints but no non-linear constraint
+            elif (
+                inequality_constraints is not None or equality_constraints is not None
+            ) and nonlinear_constraint is None:
                 X_rnd = (
                     get_polytope_samples(
                         n=n * q,
@@ -164,6 +175,49 @@ def gen_batch_initial_conditions(
                     .view(n, q, -1)
                     .cpu()
                 )
+
+            # Some combination of inequality constraints and/or equality
+            # constraints, but with non-linear constraints
+            else:
+                if sample_around_best:
+                    BotorchWarning(
+                        "sample_around_best is True but there are "
+                        "non-linear constraints provided. This might lead to "
+                        "unexpected behavior since sampling points around "
+                        "best has some random behavior which could violate "
+                        "the non-linear constraints"
+                    )
+                need = n * q
+                all_points = torch.tensor([]).cpu()
+                ndims = bounds.shape[1]
+                counter = 0
+                while all_points.ahpe[0] <= need:
+                    X_rnd = (
+                        get_polytope_samples(
+                            n=n * q,
+                            bounds=bounds,
+                            inequality_constraints=inequality_constraints,
+                            equality_constraints=equality_constraints,
+                            seed=seed,
+                            n_burnin=options.get("n_burnin", 10000),
+                            thinning=options.get("thinning", 32),
+                        )
+                        .view(n, q, -1)
+                        .cpu()
+                    )
+                    X_rnd = X_rnd.reshape(-1, ndims)
+                    where = torch.where(nonlinear_constraint(X_rnd))[0]
+                    all_points = torch.cat([all_points, X_rnd[where, :]], axis=0)
+                    counter += 1
+                    if counter >= 1000:
+                        BotorchWarning(
+                            "1000 iterations of trying to satisfy the "
+                            "provided non-linear constraint. Recommend "
+                            "revisiting the parameters of this constraint, "
+                            "as it appears hard to satisfy it."
+                        )
+                X_rnd = all_points[:need, :].reshape(num_restarts, q, ndims)
+
             # sample points around best
             if sample_around_best:
                 X_best_rnd = sample_points_around_best(
